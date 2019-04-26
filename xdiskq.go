@@ -4,9 +4,12 @@
 package xdiskq
 
 import (
+	"bufio"
 	"bytes"
+	"encoding/binary"
+	"errors"
 	"fmt"
-	"go-common/app/service/ops/log-agent/pkg/bufio"
+	"io"
 	"log"
 	"math/rand"
 	"os"
@@ -16,7 +19,13 @@ import (
 	"time"
 )
 
-// TODO 7/20
+// REF
+// https://github.com/nsqio/go-diskqueue/blob/master/diskqueue.go
+//
+// https://swanspouse.github.io/2018/11/27/nsq-disk-queue/
+//
+
+// TODO 17/20
 // diskq一共20个函数，26个field，外面两个函数
 type diskQueue struct {
 	// 外部传入的元信息
@@ -58,7 +67,7 @@ type diskQueue struct {
 	writeBuf  bytes.Buffer
 
 	// 锁
-	sync.Mutex
+	sync.RWMutex
 }
 
 // 新建一个队列实例
@@ -100,7 +109,15 @@ func newDiskQueue(name string, dataPath string, maxBytesPerFile int64,
 // publish函数 start
 // 写数据
 func (d *diskQueue) Put(data []byte) error {
-	return nil
+	d.RLock()
+	defer d.RUnlock()
+
+	if d.exitFlag == 1 {
+		return errors.New("existing")
+	}
+
+	d.writeChan <- data
+	return <-d.writeResponseChan
 }
 
 // 读数据
@@ -108,16 +125,36 @@ func (d *diskQueue) ReadChan() chan []byte {
 	return d.readChan
 }
 
+// 关闭之前同步文件
 func (d *diskQueue) Close() error {
-	return nil
+	err := d.exit(false)
+	if err != nil {
+		return err
+	}
+
+	return d.sync()
 }
 
-func (d *diskQueue) delete() error {
-	return nil
+// 不保存直接关闭
+func (d *diskQueue) Delete() error {
+	return d.exit(true)
 }
 
+// 删除所有的文件
 func (d *diskQueue) Empty() error {
-	return nil
+	d.RLock()
+	defer d.RUnlock()
+
+	if d.exitFlag == 1 {
+		return errors.New("existing")
+	}
+
+	log.Printf("[WARN] DiskQueue(%s): emptying", d.name)
+
+	// 给ioLoop发送清空的信号
+	d.emptyChan <- 1
+
+	return <-d.emptyResponseChan
 }
 
 func (d *diskQueue) Depth() int64 {
@@ -201,14 +238,164 @@ exit:
 
 // io start
 func (d *diskQueue) readOne() ([]byte, error) {
-	return nil, nil
+	var err error
+	var msgSize int32
+
+	// 打开文件
+	if d.readFile == nil {
+		curFileName := d.fileName(d.readFileNum)
+		d.readFile, err = os.OpenFile(curFileName, os.O_RDONLY, 0600)
+		if err != nil {
+			return nil, err
+		}
+
+		log.Printf("DiskQueue(%s): readOne() opened %s", d.name, curFileName)
+
+		// 找到上次读取的文件的结束位置
+		if d.readPos > 0 {
+			// seek游标开始的位置: 0-开头 1-当前位置 2-末尾
+			_, err = d.readFile.Seek(d.readPos, 0)
+			if err != nil {
+				d.readFile.Close()
+				d.readFile = nil
+				return nil, err
+			}
+		}
+
+		//包装文件读取流
+		d.reader = bufio.NewReader(d.readFile)
+	}
+
+	// 大端读取(低位地址内存的高位地址存放)
+	err = binary.Read(d.reader, binary.BigEndian, &msgSize)
+	if err != nil {
+		d.readFile.Close()
+		d.readFile = nil
+		return nil, err
+	}
+
+	// 读取msgSize的数据
+	readBuf := make([]byte, msgSize)
+	_, err = io.ReadFull(d.reader, readBuf)
+	if err != nil {
+		d.readFile.Close()
+		d.readFile = nil
+		return nil, err
+	}
+
+	//头部的msgSize为int32占用了4个字节
+	totalBytes := int64(4 + msgSize)
+
+	//设置下一个读取的位置
+	d.nextReadPos = d.readPos + totalBytes
+	d.nextReadFileNum = d.readFileNum
+
+	//如果超过了大小，读取下一个文件
+	if d.nextReadPos > d.maxBytesPerFile {
+		if d.readFile != nil {
+			d.readFile.Close()
+			d.readFile = nil
+		}
+
+		d.nextReadFileNum++
+		d.nextReadPos = 0
+	}
+
+	return readBuf, nil
 }
 
 func (d *diskQueue) writeOne(data []byte) error {
-	return nil
+	var err error
+
+	// 打开文件
+	if d.writeFile == nil {
+		curFileName := d.fileName(d.writeFileNum)
+		// TODO 权限位为什么是766
+		d.writeFile, err = os.OpenFile(curFileName, os.O_RDWR|os.O_CREATE, 0766)
+		if err != nil {
+			return err
+		}
+
+		log.Printf("DiskQueue(%s): writeOne() opened %s", d.name, curFileName)
+
+		// 找下一个写的位置
+		if d.writePos > 0 {
+			_, err = d.writeFile.Seek(d.writePos, 0)
+			if err != nil {
+				d.writeFile.Close()
+				d.writeFile = nil
+				return err
+			}
+		}
+	}
+
+	// 写入长度
+	dataLen := len(data)
+
+	d.writeBuf.Reset()
+	err = binary.Write(&d.writeBuf, binary.BigEndian, int32(dataLen))
+
+	// 先写缓存，再写入数据
+	_, err = d.writeBuf.Write(data)
+	if err != nil {
+		return err
+	}
+
+	_, err = d.writeFile.Write(d.writeBuf.Bytes())
+	if err != nil {
+		d.writeFile.Close()
+		d.writeFile = nil
+		return err
+	}
+
+	//写入数据的下一个位置
+	totalBytes := int64(4 + dataLen)
+	d.writePos += totalBytes
+	// depth + 1
+	atomic.AddInt64(&d.depth, 1)
+
+	//如果写满了，写下一个文件
+	if d.writePos > d.maxBytesPerFile {
+		d.writeFileNum++
+		d.writePos = 0
+
+		// 写meta文件
+		err = d.sync()
+		if err != nil {
+			log.Printf("[ERROR] DiskQueue(%s) failed to sync - %s", d.name, err)
+		}
+
+		if d.writeFile != nil {
+			d.writeFile.Close()
+			d.writeFile = nil
+		}
+
+	}
+
+	return err
 }
 
+// 写meta文件，并且写文件入磁盘
 func (d *diskQueue) sync() error {
+	// 数据落盘
+	if d.writeFile != nil {
+		err := d.writeFile.Sync()
+		if err != nil {
+			d.writeFile.Close()
+			d.writeFile = nil
+			return err
+		}
+	}
+
+	// 存储元数据
+	err := d.persistMetaData()
+	if err != nil {
+		return err
+	}
+
+	// 同步完了就不需要同步了
+	d.needSync = false
+
 	return nil
 }
 
@@ -274,7 +461,17 @@ func (d *diskQueue) persistMetaData() error {
 }
 
 func (d *diskQueue) deleteAllFiles() error {
-	return nil
+	// 删除数据文件
+	err := d.skipToNextRWFile()
+
+	// 删除元文件
+	innerErr := os.Remove(d.metaDataFileName())
+	if innerErr != nil && !os.IsNotExist(innerErr) {
+		log.Printf("[ERROR] DiskQueue(%s) failed to remove metadata file - %s", d.name, err)
+		return innerErr
+	}
+
+	return err
 }
 
 // io end
@@ -284,8 +481,41 @@ func (d *diskQueue) moveForward() {
 
 }
 
-func skipToNextRWFile() error {
-	return nil
+func (d *diskQueue) skipToNextRWFile() error {
+	var err error
+
+	// 关闭读流
+	if d.readFile != nil {
+		d.readFile.Close()
+		d.readFile = nil
+	}
+
+	// 关闭写流
+	if d.writeFile != nil {
+		d.writeFile.Close()
+		d.writeFile = nil
+	}
+
+	// 删除目前还没有读取的所有数据
+	for i := d.readFileNum; i <= d.writeFileNum; i++ {
+		fn := d.fileName(i)
+		innerErr := os.Remove(fn)
+		if innerErr != nil && !os.IsNotExist(innerErr) {
+			log.Printf("[ERROR] DiskQueue(%s) failed to remove data file - %s", d.name, innerErr)
+			err = innerErr
+		}
+	}
+
+	// 数据归位
+	d.writeFileNum++
+	d.writePos = 0
+	d.readFileNum = d.writeFileNum
+	d.readPos = 0
+	d.nextReadFileNum = d.writeFileNum
+	d.nextReadPos = 0
+	atomic.StoreInt64(&d.depth, 0)
+
+	return err
 }
 
 func (d *diskQueue) handleReadError() {
@@ -296,7 +526,39 @@ func (d *diskQueue) checkTailCorruption(depth int64) {
 
 }
 
+// exist 表示退出之前是否同步chan里面目前存在的数据
 func (d *diskQueue) exit(deleted bool) error {
+	d.Lock()
+	defer d.Unlock()
+
+	// 标记已经退出
+	d.exitFlag = 1
+
+	if deleted {
+		log.Printf("[WARN] DiskQueue(%s): deleting", d.name)
+	} else {
+		log.Printf("[WARN] DiskQueue(%s): closing", d.name)
+	}
+
+	// 关闭通道保证select分支可以走到
+	close(d.exitChan)
+
+	// 确保ioLoop函数可以正常退出
+	<-d.exitSyncChan
+
+	log.Printf("exit <<<<<< %d", d.writePos)
+
+	// 关闭文件
+	if d.readFile != nil {
+		d.readFile.Close()
+		d.readFile = nil
+	}
+
+	if d.writeFile != nil {
+		d.writeFile.Close()
+		d.writeFile = nil
+	}
+
 	return nil
 }
 
