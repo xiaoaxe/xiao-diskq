@@ -23,9 +23,8 @@ import (
 // https://github.com/nsqio/go-diskqueue/blob/master/diskqueue.go
 //
 // https://swanspouse.github.io/2018/11/27/nsq-disk-queue/
-//
+// http://guoyon9hui.com/blog/2018/04/22/NSQ%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90%E4%B9%8B%E5%9B%9B%EF%BC%9ATopic-Channel%E7%9A%84%E7%A3%81%E7%9B%98%E6%B6%88%E6%81%AF%E9%98%9F%E5%88%97/
 
-// TODO 17/20
 // diskq一共20个函数，26个field，外面两个函数
 type diskQueue struct {
 	// 外部传入的元信息
@@ -477,8 +476,27 @@ func (d *diskQueue) deleteAllFiles() error {
 // io end
 
 // 流程函数 start
+// 读下一个位置
 func (d *diskQueue) moveForward() {
+	oldReadFileNum := d.readFileNum
+	d.readFileNum = d.nextReadFileNum
+	d.readPos = d.nextReadPos
+	// 少了就减一层
+	depth := atomic.AddInt64(&d.depth, -1)
 
+	//如果跳到了下一个文件, 同步数据 并删除已经读完的文件
+	if oldReadFileNum != d.nextReadFileNum {
+		d.needSync = true
+
+		fn := d.fileName(oldReadFileNum)
+		err := os.Remove(fn)
+		if err != nil {
+			log.Printf("[ERROR] failed to Rmove(%s) - %s", fn, err)
+		}
+	}
+
+	// 读写状态同步，读不能在写前面
+	d.checkTailCorruption(depth)
 }
 
 func (d *diskQueue) skipToNextRWFile() error {
@@ -519,11 +537,79 @@ func (d *diskQueue) skipToNextRWFile() error {
 }
 
 func (d *diskQueue) handleReadError() {
+	// 如果读失败，当前的文件有问题，跳到读取下一个文件
+	if d.readFileNum == d.writeFileNum {
+		if d.writeFile != nil {
+			d.writeFile.Close()
+			d.writeFile = nil
+		}
+		d.writeFileNum++
+		d.writePos = 0
+	}
 
+	badFn := d.fileName(d.readFileNum)
+	badRenameFn := badFn + ".bad"
+
+	log.Printf("[WARN] DiskQueue(%s) jump to next file and saving bad file as %s",
+		d.name, badRenameFn)
+
+	err := atomicRename(badFn, badRenameFn)
+	if err != nil {
+		log.Printf("[ERROR] DiskQueue(%s) failed to rename bad DiskQueue file %s to %s",
+			d.name, badFn, badRenameFn)
+	}
+
+	//数据归位
+	d.readFileNum++
+	d.readPos = 0
+	d.nextReadFileNum = d.readFileNum
+	d.nextReadPos = 0
+
+	//状态改变了，同步一下数据的状态
+	d.needSync = true
 }
 
+// 读写状态同步，读不能在写前面，corruption-腐败,放荡...
 func (d *diskQueue) checkTailCorruption(depth int64) {
+	if d.readFileNum < d.writeFileNum || d.readPos < d.writePos {
+		return
+	}
 
+	//处理depth不为0的不符合预期的情况
+	if depth != 0 {
+		if depth < 0 {
+			// 读比写的次数多，meta文件有误
+			log.Printf("[ERROR] DiskQueue(%s) negative depth at tail (%d), metadata corruption, resetting 0...",
+				d.name, depth)
+		} else if depth > 0 {
+			// 写比读的次数多，会有数据丢失
+			log.Printf("[ERROR] DiskQueue(%s) positive depth at tail (%d), data loss, resetting 0...",
+				d.name, depth)
+		}
+
+		//强制设置depth为0，并因数据改变需要同步数据
+		atomic.StoreInt64(&d.depth, 0)
+		d.needSync = true
+	}
+
+	//处理读写位置不一致的情况
+	if d.readFileNum != d.writeFileNum || d.readPos != d.writePos {
+		if d.readFileNum > d.writeFileNum {
+			// 读比写文件提前
+			log.Printf("[ERROR] DiskQueue(%s) readFileNum > writeFileNum (%d > %d), corruption,skipping to next writeFileNum and resetting 0...",
+				d.name, d.readFileNum, d.writeFileNum)
+		}
+
+		if d.readPos > d.writePos {
+			// 读比写位置提前
+			log.Printf("[ERROR] DiskQueue(%s) readPos > writePos (%d > %d), corruption,skipping to next writeFileNum and resetting 0...",
+				d.name, d.readPos, d.writePos)
+		}
+
+		//跳到下一个文件的位置，然后同步改变数据
+		d.skipToNextRWFile()
+		d.needSync = true
+	}
 }
 
 // exist 表示退出之前是否同步chan里面目前存在的数据
